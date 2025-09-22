@@ -1,0 +1,6 @@
+adafruit-circuitpython-dht
+opencv-python
+numpy
+paho-mqtt
+board
+digitalio
