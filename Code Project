@@ -1,0 +1,239 @@
+"""
+Smart Class Monitoring System
+Author: Mohammad Alwi Ferdiansyah Alfarizi
+Description:
+  Python-based system using DHT22 sensor and YOLOv4-tiny to monitor
+  classroom conditions (temperature, humidity, UV) and people detection.
+  Controls lighting via relay and sends real-time data to MQTT broker.
+"""
+
+import time
+import datetime
+import board
+import adafruit_dht
+import digitalio
+import cv2
+import numpy as np
+import threading
+import paho.mqtt.client as mqtt
+import json
+import queue
+
+# ==============================
+# Calibration constants
+# ==============================
+TEMP_OFFSET = -4.9  # Temperature correction (°C)
+HUM_OFFSET = 3.1    # Humidity correction (%)
+
+# ==============================
+# MQTT Configuration
+# ==============================
+MQTT_BROKER = "Your MQTT BROKER"
+MQTT_PORT = Port Number
+MQTT_TOPIC = "MQTT TOPIC"
+
+client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+try:
+    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    client.loop_start()
+    mqtt_connected = True
+except Exception as e:
+    print(f"MQTT Error: {e}")
+    mqtt_connected = False
+
+# ==============================
+# Sensors and actuators setup
+# ==============================
+sensor = adafruit_dht.DHT22(board.D4)
+uv_sensor = digitalio.DigitalInOut(board.D17)
+uv_sensor.direction = digitalio.Direction.INPUT
+
+lampu_1 = digitalio.DigitalInOut(board.D22)
+lampu_1.direction = digitalio.Direction.OUTPUT
+lampu_1.value = False
+
+lampu_2 = digitalio.DigitalInOut(board.D24)
+lampu_2.direction = digitalio.Direction.OUTPUT
+lampu_2.value = False
+
+# ==============================
+# YOLOv4-tiny model
+# ==============================
+yolo_net = cv2.dnn.readNet("models/yolov4-tiny.weights", "models/yolov4-tiny.cfg")
+yolo_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+yolo_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+
+layers = yolo_net.getLayerNames()
+out_layers = [layers[i - 1] for i in yolo_net.getUnconnectedOutLayers()]
+
+with open("models/coco.names", "r") as f:
+    classes = [line.strip() for line in f.readlines()]
+
+# ==============================
+# Threading & data variables
+# ==============================
+lock = threading.Lock()
+jumlah_manusia = 0
+last_detected_update_time = time.time()
+frame_queue = queue.Queue(maxsize=1)
+sensor_data = {"temperature": None, "humidity": None, "uv_status": None}
+update_event = threading.Event()
+
+# ==============================
+# Functions: Sensors, Camera, Lamp Control
+# ==============================
+def dalam_jam_operasional():
+    now = datetime.datetime.now().time()
+    return datetime.time(8, 0) <= now <= datetime.time(17, 0)
+
+def baca_sensor():
+    global sensor_data
+    while True:
+        if dalam_jam_operasional():
+            try:
+                temperature_c = sensor.temperature
+                humidity = sensor.humidity
+                if temperature_c is not None and humidity is not None:
+                    temperature_c += TEMP_OFFSET
+                    humidity += HUM_OFFSET
+                    with lock:
+                        sensor_data["temperature"] = round(temperature_c, 1)
+                        sensor_data["humidity"] = round(humidity, 1)
+                        sensor_data["uv_status"] = "Detected" if uv_sensor.value else "Not Detected"
+                    update_event.set()
+            except RuntimeError:
+                pass
+            except Exception as e:
+                print(f"Kesalahan Sensor: {e}")
+        else:
+            print("Di luar jam operasional.")
+        time.sleep(2)
+
+def kontrol_lampu():
+    global jumlah_manusia, last_detected_update_time
+    lampu_1_status = False
+    lampu_2_status = False
+
+    while True:
+        if dalam_jam_operasional():
+            update_event.wait()
+            update_event.clear()
+            with lock:
+                uv_detected = sensor_data["uv_status"] == "Detected"
+                current_people_count = jumlah_manusia
+                last_seen = last_detected_update_time
+
+            current_time = time.time()
+            elapsed_no_detection = current_time - last_seen
+            lamp_status = "OFF"
+
+            if current_people_count > 0:
+                if current_people_count > 4:
+                    lampu_1.value = True
+                    lampu_2.value = True
+                    lampu_1_status = True
+                    lampu_2_status = True
+                    lamp_status = "Lamp 1 & 2 ON"
+                else:
+                    lampu_1.value = True
+                    lampu_2.value = False
+                    lampu_1_status = True
+                    lampu_2_status = False
+                    lamp_status = "Lamp 1 ON"
+            else:
+                if elapsed_no_detection >= 120:
+                    lampu_1.value = False
+                    lampu_2.value = False
+                    lampu_1_status = False
+                    lampu_2_status = False
+                    lamp_status = "OFF (No human >2min)"
+                else:
+                    lampu_1.value = lampu_1_status
+                    lampu_2.value = lampu_2_status
+                    lamp_status = "Waiting... within 2 min grace"
+
+            data = {
+                "temperature": sensor_data["temperature"],
+                "humidity": sensor_data["humidity"],
+                "uv_status": sensor_data["uv_status"],
+                "people_count": current_people_count,
+                "lamp_status": lamp_status,
+            }
+
+            if mqtt_connected:
+                try:
+                    client.publish(MQTT_TOPIC, json.dumps(data))
+                except Exception as e:
+                    print(f"MQTT Error: {e}")
+            print(json.dumps(data, indent=4))
+        else:
+            lampu_1.value = False
+            lampu_2.value = False
+            print("Di luar jam operasional, lampu mati.")
+        time.sleep(1)
+
+def baca_kamera():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: Kamera tidak dapat dibuka.")
+        return
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    while True:
+        if dalam_jam_operasional():
+            ret, frame = cap.read()
+            if not ret:
+                print("Gagal membaca frame.")
+                time.sleep(1)
+                continue
+            if not frame_queue.full():
+                frame_queue.put(frame)
+        else:
+            time.sleep(5)
+
+def deteksi_manusia():
+    global jumlah_manusia, last_detected_update_time
+    while True:
+        if dalam_jam_operasional():
+            if frame_queue.empty():
+                continue
+            frame = frame_queue.get()
+            blob = cv2.dnn.blobFromImage(frame, 0.00392, (320, 320), swapRB=True, crop=False)
+            yolo_net.setInput(blob)
+            outputs = yolo_net.forward(out_layers)
+            people_count = 0
+            for output in outputs:
+                for detection in output:
+                    scores = detection[5:]
+                    class_id = np.argmax(scores)
+                    confidence = scores[class_id]
+                    if classes[class_id] == "person" and confidence > 0.5:
+                        people_count += 1
+            with lock:
+                jumlah_manusia = people_count
+                if people_count > 0:
+                    last_detected_update_time = time.time()
+                update_event.set()
+        else:
+            jumlah_manusia = 0
+            update_event.set()
+        time.sleep(1)
+
+def tampilkan_video():
+    while True:
+        if dalam_jam_operasional() and not frame_queue.empty():
+            frame = frame_queue.get()
+            cv2.imshow("Deteksi Manusia", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+    cv2.destroyAllWindows()
+
+# Jalankan thread
+threading.Thread(target=baca_sensor, daemon=True).start()
+threading.Thread(target=kontrol_lampu, daemon=True).start()
+threading.Thread(target=baca_kamera, daemon=True).start()
+threading.Thread(target=deteksi_manusia, daemon=True).start()
+threading.Thread(target=tampilkan_video, daemon=True).start()
+
+while True:
+    time.sleep(0.1)
